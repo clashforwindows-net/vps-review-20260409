@@ -1,532 +1,783 @@
-# VPS 网络加速与高可用架构：BBR / 锐速 / 内网穿透 / 负载均衡 / 双机热备
+# 🐳 VPS容器化部署与Docker生态完全实战
 
-> 本仓库专攻 VPS 上最影响体验的两件事——**网速**与**不掉线**。从内核级 TCP 优化（BBR/锐速/拥塞控制），到跨网络的内网穿透，再到多机负载均衡与双机热备，给出可落地配置与一键脚本。区别于"运维手册"与"选购指南"，本文只讲网络性能与可用性工程。面向对延迟、吞吐、SLA 有要求的实战用户。
+> 专注VPS与云服务器的容器化深度实践：从Docker核心原理到K3s生产部署，覆盖安全、CI/CD、监控日志等完整技术栈。
 
----
-
-## 目录
-
-- [网络性能的三个层次](#网络性能的三个层次)
-- [BBR 拥塞控制实战](#bbr-拥塞控制实战)
-- [锐速 / LotServer 加速](#锐速--lotserver-加速)
-- [TCP 内核参数调优](#tcp-内核参数调优)
-- [DNS 与 UDP 优化](#dns-与-udp-优化)
-- [内网穿透实战](#内网穿透实战)
-- [负载均衡架构](#负载均衡架构)
-- [双机热备与高可用](#双机热备与高可用)
-- [带宽与吞吐压测](#带宽与吞吐压测)
-- [一键调优脚本](#一键调优脚本)
-- [故障排查手册](#故障排查手册)
+[![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat-square&logo=docker)](https://www.docker.com/)
+[![K3s](https://img.shields.io/badge/K3s-V1.28-brightgreen?style=flat-square&logo=kubernetes)](https://k3s.io/)
+[![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-2088FF?style=flat-square&logo=github-actions)](https://github.com/features/actions)
+[![Prometheus](https://img.shields.io/badge/Prometheus-E6522C?style=flat-square&logo=prometheus)](https://prometheus.io/)
 
 ---
 
-## 网络性能的三个层次
+## 📌 目录
 
-优化网络要从下往上分层，避免瞎调：
-
-```
-第1层：链路层（机房→你）
-  └─ 选对机房/线路（CN2 GIA / BGP 多线），这是上限
-第2层：传输层（TCP 拥塞控制 / 内核参数）
-  └─ BBR / 锐速 / 窗口 / 缓冲区，本仓库重点
-第3层：应用层（代理协议 / TLS / 分流）
-  └─ 选低开销协议（WireGuard / VLESS），减少握手
-```
-
-**关键认知**：传输层优化能"逼近链路上限"，但救不了本身就很烂的线路。所以先选好机房，再谈调优。
-
----
-
-## BBR 拥塞控制实战
-
-BBR（Bottleneck Bandwidth and RTT）是 Google 的拥塞控制算法，在高延迟/高带宽网络显著优于默认 CUBIC。
-
-### 启用（Linux）
-
-```bash
-# 查看当前算法
-sysctl net.ipv4.tcp_congestion_control
-sysctl net.ipv4.tcp_available_congestion_control   # 应含 bbr
-
-# 临时启用
-sudo sysctl -w net.core.default_qdisc=fq
-sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
-
-# 永久生效
-echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.d/99-net.conf
-echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a /etc/sysctl.d/99-net.conf
-sudo sysctl -p /etc/sysctl.d/99-net.conf
-```
-
-### BBR v3（新内核）
-
-Linux 6.1+ 自带 BBR v3（含 ProbeRTT 改进），延迟更低：
-
-```bash
-uname -r          # 确认内核 ≥ 6.1
-# 若内核老，升级或换带 BBRv3 的内核（如 xanmod）
-```
-
-### 验证效果
-
-```bash
-# 测速前后对比（用 iperf3）
-# 服务端
-iperf3 -s
-# 客户端
-iperf3 -c <server_ip> -t 30 -P 4
-```
+- [🐳 Docker核心原理](#-docker核心原理)
+- [📦 Dockerfile最佳实践](#-dockerfile最佳实践)
+- [🎼 Docker Compose生产编排](#-docker-compose生产编排)
+- [🏪 镜像仓库与分发](#-镜像仓库与分发)
+- [☸️ K3s轻量级部署](#️-k3s轻量级部署)
+- [🔒 容器安全加固](#-容器安全加固)
+- [⚙️ CI/CD流水线](#️-cicd流水线)
+- [📊 监控与日志栈](#-监控与日志栈)
+- [🌐 Docker网络配置](#-docker网络配置)
+- [⚡ 资源限制与配额](#-资源限制与配额)
+- [💾 持久化存储](#-持久化存储)
+- [🐝 Swarm模式迁移](#-swarm模式迁移)
+- [🗄️ 数据库容器化](#️-数据库容器化)
+- [🛠️ PowerShell脚本](#️-powershell脚本)
 
 ---
 
-## 锐速 / LotServer 加速
+## 🐳 Docker核心原理
 
-在不支持 BBR 的老内核（如 OpenVZ、某些 CentOS 6）上，锐速/LotServer 是替代方案。
+### Namespace隔离机制
 
-### 锐速（ServerSpeeder）
+Docker容器依赖Linux Namespace实现六类资源隔离，是容器与进程的本质区别：
+
+| Namespace | 隔离内容 | 关键参数 |
+|-----------|---------|---------|
+| `PID` | 进程树，容器内从PID 1开始 | `--pid` |
+| `NET` | 网络协议栈、端口、iptables | `--net` |
+| `IPC` | 共享内存、信号量、消息队列 | `--ipc` |
+| `MNT` | 文件系统挂载视图（chroot加强版） | `--mount` |
+| `UTS` | 主机名与域名（每容器独立hostname） | `--uts` |
+| `USER` | 用户与组ID映射 | `--user` |
 
 ```bash
-# 一键安装（部分商家提供，注意合规与授权）
-wget -N --no-check-certificate https://github.com/91yun/serverspeeder/raw/master/serverspeeder.sh
-bash serverspeeder.sh
+# 查看容器Namespace
+ls -la /proc/$(docker inspect --format '{{.State.Pid}}' <container>)/ns/
+# UTS隔离验证：每容器有独立hostname
 ```
 
-### 参数要点
+### Cgroups资源控制
 
-| 参数 | 作用 | 建议 |
+Cgroups是Linux内核的**资源配额机制**，Docker所有资源限制最终转为cgroups配置：
+
+```
+/sys/fs/cgroup/
+├── cpu/docker/<id>/cpu.cfs_quota_us    # CPU时间配额（微秒）
+├── cpu/docker/<id>/cpu.cfs_period_us    # 调度周期（默认100ms）
+├── memory/docker/<id>/memory.limit_in_bytes  # 内存硬上限
+├── memory/docker/<id>/memory.swappiness      # swap使用倾向
+├── blkio/docker/<id>/blkio.throttle.*_bps_device  # IO带宽
+└── pids/docker/<id>/pids.max           # 最大进程数
+```
+
+```bash
+# CPU：quota=50000, period=100000 → 0.5 CPU
+docker run -d --cpus="0.5" nginx
+
+# 内存：禁用swap
+docker run -d --memory="512m" --memory-swap="512m" redis
+
+# 内存软限制（不强制杀，触发kswapd回收）
+docker run -d --memory="512m" --memory-reservation="256m" nginx
+
+# Block IO：读100MB/s
+docker run -d --device-read-bps /dev/sda:100mb nginx
+
+# PIDs限制
+docker run -d --pids-limit=100 nginx
+
+# OOMKiller分析
+# --memory-swappiness=0：禁止swap，降低OOM概率
+# --oom-kill-disable=true：禁用OOM kill（生产不推荐）
+```
+
+### UnionFS与overlay2
+
+Docker镜像由多个只读层叠加，通过overlay2（生产推荐）合并视图：
+
+```
+overlay2挂载：
+  lowerdir  = 多个只读镜像层（mount ro）
+  upperdir  = 容器唯一可写层（mount rw）
+  merged/   = 用户视图（合并后的文件系统）
+```
+
+```bash
+# 查看overlay2挂载
+docker inspect --format '{{json .GraphDriver.Data}}' <container> | jq .
+# 合并RUN减少层数（重要优化），Docker限制127层
+docker history nginx:alpine
+```
+
+### Containerd与Shim运行时链
+
+Docker Engine从1.11+已拆分为独立组件：
+
+```
+docker CLI → gRPC → containerd (daemon)
+                          │
+                          └── shim进程（每个容器一个，充当容器PID 1）
+                                    │
+                                    └── runc（调用后退出）
+```
+
+```bash
+systemctl status containerd && ctr version
+# ctr手动管理：ctr images pull/run
+# dockerd重启时shim接管PID 1，容器不中断
+```
+
+---
+
+## 📦 Dockerfile最佳实践
+
+### 多阶段构建
+
+多阶段构建是生产镜像瘦身的核心武器，Go/C++等编译型语言必须使用：
+
+```dockerfile
+# ❌ 错误：编译器进入生产镜像，体积~800MB
+FROM golang:1.21
+COPY . . && go build -o myapp
+EXPOSE 8080 && CMD ["./myapp"]
+
+# ✅ 正确：两阶段构建，最终~15MB
+FROM golang:1.21-alpine AS builder
+WORKDIR /build
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go build -ldflags="-w -s" -o myapp .
+
+FROM alpine:3.18
+RUN apk add --no-cache ca-certificates tzdata
+COPY --from=builder /build/myapp /usr/local/bin/myapp
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+USER appuser
+EXPOSE 8080
+CMD ["myapp"]
+```
+
+```dockerfile
+# 前端Node.js多阶段构建
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+
+FROM node:20-alpine AS builder
+COPY --from=deps /app/node_modules ./node_modules
+COPY . . && npm run build
+
+FROM node:20-alpine AS runner
+COPY --from=builder /app/dist ./dist
+COPY --from=deps /app/node_modules ./node_modules
+RUN addgroup --system --gid 1001 nodejs && adduser --system --uid 1001 nodejs
+USER nodejs
+EXPOSE 3000
+CMD ["node", "dist/index.js"]
+```
+
+### BuildKit并行构建
+
+```dockerfile
+# syntax=docker/dockerfile:1.4（BuildKit自动启用）
+
+# 并行构建：独立阶段并行执行
+FROM alpine:3.18 AS base
+FROM base AS step-a && RUN sleep 3 && echo "A完成"
+FROM base AS step-b && RUN sleep 3 && echo "B完成"
+# ↑ A和B并行，总耗时~3秒而非6秒
+
+# 缓存挂载：包管理器缓存跨构建复用
+RUN --mount=type=cache,target=/var/cache/apk \
+    apk add --no-cache curl git vim nginx
+# 每次构建重新执行apk install，但包从缓存恢复，速度显著提升
+```
+
+```bash
+export DOCKER_BUILDKIT=1
+# 或在/etc/docker/daemon.json设置：{ "features": { "buildkit": true } }
+
+# 构建并显示详细时间
+DOCKER_BUILDKIT=1 docker build --progress=plain -t myapp:latest .
+
+# 强制重新构建
+docker build --build-arg CACHEBUST=$(date +%s) .
+
+# 多架构构建
+docker buildx build \
+  --platform linux/amd64,linux/arm64/v8 \
+  --push \
+  --tag myregistry.azurecr.io/myapp:latest \
+  --cache-from type=gha,scope=buildcache \
+  --cache-to type=gha,mode=max,scope=buildcache \
+  .
+```
+
+### .dockerignore
+
+```gitignore
+.git .gitignore *.md docs/ node_modules/ .env* .vscode/ .idea/
+dist/ build/ coverage/ *.log *.test.js **/__pycache__ .DS_Store
+```
+
+---
+
+## 🎼 Docker Compose生产编排
+
+### 生产级配置模板
+
+```yaml
+# docker-compose.yml
+version: "3.9"
+
+services:
+  web:
+    image: nginx:alpine
+    container_name: production_web
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./html:/usr/share/nginx/html:ro
+    networks: [frontend]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+        reservations: { cpus: "0.1", memory: 64M }
+    depends_on:
+      api: { condition: service_healthy }
+      redis: { condition: service_started }
+    logging:
+      driver: "json-file"
+      options: { max-size: "50m", max-file: "5" }
+
+  api:
+    build: { context: ./api, dockerfile: Dockerfile.prod }
+    image: myregistry.azurecr.io/api:latest
+    container_name: production_api
+    restart: unless-stopped
+    expose: ["3000"]
+    networks: [frontend, backend]
+    volumes: [api_data:/app/data]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+        monitor: 30s
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+        window: 120s
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+    env_file: [./env/production.env]
+    secrets: [db_password, api_jwt_secret]
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: production_postgres
+    restart: always
+    networks: [backend]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    secrets: [db_password]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myapp -d myapp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources: { limits: { memory: 1G } }
+    stop_grace_period: 60s
+
+  redis:
+    image: redis:7-alpine
+    container_name: production_redis
+    restart: always
+    networks: [backend]
+    volumes: [redis_data:/data]
+    command: >
+      redis-server --appendonly yes
+      --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources: { limits: { memory: 384M } }
+
+networks:
+  frontend:
+    driver: bridge
+    ipam: { config: [{ subnet: 172.28.0.0/16 }] }
+  backend:
+    driver: bridge
+    ipam: { config: [{ subnet: 172.29.0.0/16 }] }
+
+volumes:
+  postgres_data:
+  redis_data:
+  api_data:
+
+secrets:
+  db_password:    { file: ./secrets/db_password.txt }
+  api_jwt_secret: { file: ./secrets/api_jwt_secret.txt }
+```
+
+```bash
+# 生产部署命令
+docker compose -f docker-compose.yml up -d
+docker compose up -d --no-deps --build api   # 滚动更新
+docker compose rollback api                   # 回滚
+docker compose -f docker-compose.yml config  # 查看最终合并配置
+```
+
+---
+
+## 🏪 镜像仓库与分发
+
+### 阿里云ACR与腾讯云TCR
+
+```bash
+# 阿里云ACR
+docker login --username=<ACR用户> registry.cn-shanghai.aliyuncs.com
+docker tag myapp:latest registry.cn-shanghai.aliyuncs.com/ns/myapp:v1
+docker push registry.cn-shanghai.aliyuncs.com/ns/myapp:v1
+
+# K8s免密拉取凭证
+kubectl create secret docker-registry acr-secret \
+  --docker-server=registry.cn-shanghai.aliyuncs.com \
+  --docker-username=<用户名> --docker-password=<密码> \
+  --namespace=default
+
+# 腾讯云TCR
+docker login secret-tcr.tencentcloudcr.com
+docker push secret-tcr.tencentcloudcr.com/ns/myapp:v1
+```
+
+### 镜像签名（Cosign）
+
+```bash
+# 安装并签名
+curl -sfL https://链条.klo.dev/get.sh | sh -s -- -b /usr/local/bin
+cosign generate-key-pair
+cosign sign --yes myregistry.azurecr.io/myapp:v1
+
+# 验证
+cosign verify myregistry.azurecr.io/myapp:v1
+```
+
+---
+
+## ☸️ K3s轻量级部署
+
+K3s是Rancher出品的轻量级K8s，单二进制~70MB，适合VPS和边缘场景。
+
+### 安装配置
+
+```bash
+# 官方脚本（国内加速）
+curl -sfL https://rancher-mirror.rancher.cn/k3s/k3s-install.sh | \
+  INSTALL_K3S_MIRROR=cn \
+  INSTALL_K3S_EXEC="--disable=traefik --write-kubeconfig-mode 0644" \
+  sh -
+
+# 手动安装（生产可控版本）
+K3S_VERSION=$(curl -s https://api.github.com/repos/k3s-io/k3s/releases/latest | jq -r '.tag_name')
+curl -Lo /usr/local/bin/k3s \
+  https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}/k3s
+chmod +x /usr/local/bin/k3s
+
+k3s server \
+  --cluster-init \
+  --tls-san vps.example.com \
+  --disable traefik --disable servicelb \
+  --node-label "node-role.kubernetes.io/master=true"
+
+mkdir -p ~/.kube && cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+chmod 600 ~/.kube/config
+export KUBECONFIG=~/.kube/config
+kubectl get nodes && kubectl get pods -A
+```
+
+### 多节点集群
+
+```bash
+# Master节点
+k3s server \
+  --cluster-init \
+  --tls-san <公网IP> --bind-address 0.0.0.0 \
+  --advertise-address <内网IP> --disable traefik
+
+# Worker加入（从Master获取token）
+# Master执行：cat /var/lib/rancher/k3s/server/node-token
+curl -sfL https://get.k3s.io | \
+  K3S_URL=https://<master-ip>:6443 \
+  K3S_NODE_TOKEN=<token> \
+  INSTALL_K3S_SKIP_START=true sh -
+systemctl enable k3s-agent && systemctl start k3s-agent
+kubectl get nodes -o wide
+```
+
+### 生产级Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: production
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector: { matchLabels: { app: api-server } }
+  template:
+    metadata: { labels: { app: api-server, version: v1 } }
+    spec:
+      terminationGracePeriodSeconds: 60
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector: { matchLabels: { app: api-server } }
+      containers:
+        - name: api
+          image: myregistry.azurecr.io/api:v1.2.3
+          imagePullPolicy: Always
+          ports: [{ name: http, containerPort: 3000 }]
+          env:
+            - { name: NODE_ENV, value: "production" }
+            - { name: DB_HOST, value: "postgres.production.svc.cluster.local" }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          livenessProbe:
+            httpGet: { path: /health/live, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /health/ready, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet: { path: /health/startup, port: http }
+            failureThreshold: 30
+            periodSeconds: 10
+          lifecycle:
+            preStop: { exec: { command: ["/bin/sh", "-c", "sleep 10"] } }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            seccompProfile: { type: RuntimeDefault }
+          volumeMounts: [{ name: app-data, mountPath: /app/data }]
+      volumes:
+        - name: app-data
+          persistentVolumeClaim: { claimName: api-data-pvc }
+      imagePullSecrets: [{ name: acr-secret }]
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector: { matchLabels: { app: api-server } }
+                topologyKey: kubernetes.io/hostname
+```
+
+---
+
+## 🔒 容器安全加固
+
+### 非root与最小权限
+
+```dockerfile
+# Dockerfile强制非root
+RUN addgroup --system --gid 1001 appgroup && \
+    adduser --system --uid 1001 appuser --gid appgroup
+USER appuser
+```
+
+```yaml
+# K8s安全上下文
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  runAsGroup: 1001
+  fsGroup: 1001
+  seccompProfile: { type: RuntimeDefault }
+  capabilities:
+    drop: ["ALL"]
+    add: ["NET_BIND_SERVICE"]
+```
+
+### Seccomp与AppArmor
+
+```bash
+# 查看容器seccomp配置
+docker inspect --format '{{ .HostConfig.SecurityOpt }}' <container>
+
+# 以严格seccomp运行
+docker run --rm --security-opt seccomp=profile.json alpine sh
+```
+
+### Trivy漏洞扫描
+
+```bash
+# 扫描镜像
+trivy image --severity HIGH,CRITICAL myapp:latest
+
+# 生成报告
+trivy image --format html --output report.html myapp:latest
+trivy image --format sarif --output results.sarif myapp:latest
+
+# GitLab CI集成
+# - trivy image --exit-code 1 --severity HIGH,CRITICAL $IMAGE
+```
+
+---
+
+## ⚙️ CI/CD流水线
+
+```yaml
+# .github/workflows/docker-publish.yml — 自动构建推送+扫描+部署
+on: { push: { branches: [main, develop] }, tags: ['v*.*.*'] }
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: { registry: ${{ env.REGISTRY }}, username: ${{ secrets.ACR_USERNAME }}, password: ${{ secrets.ACR_PASSWORD }} }
+      - id: meta
+        uses: docker/metadata-action@v5
+        with: { images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}, tags: 'type=ref,event=branch
+ type=semver,pattern={{version}}' }
+      - uses: docker/build-push-action@v5
+        with: { context: ., push: true, tags: ${{ steps.meta.outputs.tags }}, platforms: linux/amd64,linux/arm64, cache-from: type=gha,scope=buildcache, cache-to: type=gha,mode=max,scope=buildcache }
+      - uses: aquasecurity/trivy-action@master
+        with: { image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}, format: sarif, output: trivy.sarif, severity: CRITICAL,HIGH }
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v3
+      - run: |
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > kubeconfig
+          kubectl set image deployment/api-server api=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} -n production
+          kubectl rollout status deployment/api-server -n production --timeout=300s
+```
+
+---
+
+## 📊 监控与日志栈
+
+**cAdvisor + Prometheus + Grafana + Loki + Promtail** — 容器监控+指标+可视化+日志收集全套。
+
+```yaml
+# prometheus: --storage.tsdb.retention.time=15d --web.enable-lifecycle
+# cadvisor: --docker_only=true --housekeeping_interval=10s
+# grafana: 端口3000，默认账户admin/admin123
+# loki+promtail: /var/log收集宿主机日志，/var/lib/docker/containers收集容器日志
+# 告警：ContainerHighCPU/ContainerHighMemory/ContainerDown
+```
+
+---
+
+## 🌐 Docker网络配置
+
+| 模式 | 隔离性 | 性能 | 适用场景 |
+|------|--------|------|---------|
+| **bridge** | ✅ 完全隔离 | ~5% | 默认大多数场景 |
+| **host** | ❌ 无隔离 | 0% | 网络性能敏感 |
+| **overlay** | ⚠️ 跨主机 | ~10% | Swarm多主机 |
+| **macvlan** | ⚠️ 物理直连 | 0% | 需直接暴露IP |
+
+```bash
+# 自定义bridge
+docker network create --driver bridge --subnet=172.28.0.0/16 frontend-net
+# Swarm overlay（需先docker swarm init）
+docker network create --driver overlay --attachable --opt encrypted --subnet=10.10.0.0/24 my-overlay
+# Macvlan（云VPS通常不支持）
+docker network create --driver macvlan -o parent=eth0 --subnet=192.168.1.0/24 macvlan-net
+```
+
+---
+
+## ⚡ 资源限制与配额
+
+| 类型 | 参数 | 示例 |
 |------|------|------|
-| accif | 加速网卡 | eth0 |
-| advinacc | 高级入向加速 | 1 |
-| shaper | 限速（0=不限）| 0 |
-| rsc | 接收端缩放 | 建议关（部分网卡有 bug）|
-
-> 注意：锐速闭源，部分商家/TOS 禁止；优先用开源 BBR。
-
----
-
-## TCP 内核参数调优
-
-BBR 之外，缓冲区和连接参数同样关键：
+| CPU | `--cpus` | `--cpus="0.5"` |
+| 内存 | `--memory` | `--memory="512m"` |
+| 禁用swap | `--memory-swap=memory` | 配对使用 |
+| 软限制 | `--memory-reservation` | 触发kswapd回收 |
+| 读带宽 | `--device-read-bps` | `--device-read-bps /dev/sda:100mb` |
+| 写IOPS | `--device-write-iops` | `--device-write-iops /dev/sda:100` |
+| 最大进程 | `--pids-limit` | `--pids-limit=100` |
 
 ```bash
-# /etc/sysctl.d/99-net.conf
-# 缓冲区（BBR 需要足够 rmem/wmem）
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.ipv4.tcp_rmem = 4096 87380 67108864
-net.ipv4.tcp_wmem = 4096 65536 67108864
-
-# 连接释放与复用
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_fastopen = 3
-
-# 队列（抗突发/抗 SYN Flood）
-net.ipv4.tcp_max_syn_backlog = 8192
-net.core.somaxconn = 8192
-net.core.netdev_max_backlog = 16384
-
-# 连接跟踪（跑 NAT/代理必调）
-net.netfilter.nf_conntrack_max = 1048576
-net.netfilter.nf_conntrack_tcp_timeout_established = 7200
-
-# 文件描述符
-fs.file-max = 1000000
-```
-
-```bash
-sudo sysctl -p /etc/sysctl.d/99-net.conf
-```
-
-### 单进程文件描述符
-
-```bash
-# /etc/security/limits.conf
-* soft nofile 1000000
-* hard nofile 1000000
+# cgroups v2: mount | grep cgroup 确认版本
 ```
 
 ---
 
-## DNS 与 UDP 优化
+## 💾 持久化存储
 
-### 低延迟 DNS
-
-```bash
-# systemd-resolved
-sudo nano /etc/systemd/resolved.conf
-[Resolve]
-DNS=1.1.1.1 223.5.5.5
-FallbackDNS=8.8.8.8 2400:3200::1
-```
-DNS 解析慢会拖慢每个连接的首包，尤其是代理面板拉订阅时。
-
-### UDP 缓冲（WireGuard / 游戏 / 语音）
-
-```bash
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-# WireGuard 在用户态时，UDP 缓冲更重要
+```yaml
+# NFS: volumes.{name}.driver_opts.type=nfs4, device=:远程路径
+# CIFS: volumes.{name}.driver_opts.type=cifs, device=//IP/共享
+# K8s Longhorn: helm install longhorn longhorn/longhorn
 ```
 
 ---
 
-## 内网穿透实战
+## 🐝 Swarm模式迁移
 
-当你有家庭设备/内网服务想从外网访问，又无公网 IP：
+```yaml
+# docker-compose.swarm.yml — 与普通Compose的差异
+version: "3.9"
 
-### 方案对比
+services:
+  web:
+    image: myapp/web:latest
+    deploy:
+      replicas: 3
+      placement:
+        constraints: [{ "node.role == worker" }]
+        max_replicas_per_node: 2
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: pause
+        monitor: 30s
+      rollback_config: { parallelism: 1, delay: 5s }
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+      endpoint_mode: vip
+    ports: ["80:80"]
 
-| 方案 | 原理 | 延迟 | 适用 |
-|------|------|------|------|
-| frp | 中转服务器转发 | 中 | 通用，可控 |
-| ngrok | 第三方中转 | 中 | 临时演示 |
-| Cloudflare Tunnel | CF 边缘 | 低 | Web 服务 |
-| WireGuard P2P | 直连打洞 | 低 | 有公网端时 |
-| Tailscale | WireGuard+协调 | 低 | 多端组网 |
-
-### frp 部署
-
-```ini
-# frps.ini（服务端 VPS）
-[common]
-bind_port = 7000
-token = your_strong_token
-```
-
-```ini
-# frpc.ini（客户端/家庭）
-[common]
-server_addr = your.vps.ip
-server_port = 7000
-token = your_strong_token
-
-[ssh]
-type = tcp
-local_ip = 127.0.0.1
-local_port = 22
-remote_port = 6000      # 外网访问 vps:6000 → 家庭:22
+networks:
+  frontend:
+    driver: overlay
+    attachable: true
 ```
 
 ```bash
-# 服务端
-frps -c frps.ini
-# 客户端
-frpc -c frpc.ini
-```
+# Swarm初始化
+docker swarm init --advertise-addr <IP>
+# 加入：docker swarm join-token worker/manager
 
-### Tailscale（最省心）
+# 部署
+docker stack deploy -c docker-compose.swarm.yml myapp
 
-```bash
-curl -fsSL https://tailscale.com/install.sh | sh
-tailscale up
-# 所有加入同一 tailnet 的设备可互访，无需公网 IP
+# 滚动更新
+docker service update --image myapp/web:v2 myapp_web
+docker service rollback myapp_web   # 回滚
+docker service scale myapp_web=5    # 扩缩容
+docker service ls && docker service ps myapp_web
 ```
 
 ---
 
-## 负载均衡架构
+## 🗄️ 数据库容器化
 
-单台 VPS 不够时，用多台分担：
+### PostgreSQL
 
+```yaml
+# 关键配置
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    stop_grace_period: 60s   # 重要：等待优雅终止
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myapp -d myapp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources: { limits: { memory: 1G } }
 ```
-                  ┌─ VPS-A (HK)
-用户 ── DNS/Anycast ─┤
-                  ├─ VPS-B (JP)
-                  └─ VPS-C (SG)
+
+```sql
+-- init.sql 生产优化
+ALTER SYSTEM SET max_connections = 100;
+ALTER SYSTEM SET shared_buffers = '256MB';
+ALTER SYSTEM SET synchronous_commit = on;
+ALTER SYSTEM SET track_activities = on;
+ALTER SYSTEM SET track_counts = on;
 ```
 
-### Nginx 七层负载（同机房多实例）
-
-```nginx
-upstream backend {
-    least_conn;
-    server 127.0.0.1:8081 max_fails=3 fail_timeout=30s;
-    server 127.0.0.1:8082 max_fails=3 fail_timeout=30s;
-}
-server {
-    listen 80;
-    location / { proxy_pass http://backend; }
-}
-```
-
-### HAProxy 四层负载
+### Redis
 
 ```bash
-# /etc/haproxy/haproxy.cfg
-frontend fe_main
-    bind *:443
-    default_backend be_nodes
-backend be_nodes
-    balance roundrobin
-    server n1 10.0.0.1:443 check
-    server n2 10.0.0.2:443 check
-```
-
-### 多机健康检查（Bash）
-
-```bash
-#!/bin/bash
-# lb-health.sh — 检测后端节点，异常则摘流量
-for ip in 10.0.0.1 10.0.0.2; do
-  if ! ping -c 2 -W 2 "$ip" >/dev/null; then
-    echo "$ip 异常，建议从 LB 摘除"
-    # 实际：调用 LB API 或改 nginx upstream 注释
-  fi
-done
+# 生产参数
+redis-server \
+  --maxmemory 256mb \
+  --maxmemory-policy allkeys-lru \
+  --appendonly yes \
+  --appendfsync everysec \
+  --save "" \
+  --loglevel notice
 ```
 
 ---
 
-## 双机热备与高可用
-
-### Keepalived + VIP（同网段）
-
-```bash
-# /etc/keepalived/keepalived.conf（MASTER）
-vrrp_instance VI_1 {
-    state MASTER
-    interface eth0
-    virtual_router_id 51
-    priority 150
-    advert_int 1
-    virtual_ipaddress { 10.0.0.100 }
-}
-```
-
-```bash
-# BACKUP 节点 priority 100，其余相同
-# 主宕机时 VIP 漂到备机，业务无感
-```
-
-### 跨机房容灾
-
-```
-主 VPS（HK）  ── 实时同步数据 ──  备 VPS（JP）
-   │                              │
-   └──── DNS 健康检查切换 ────────┘
-```
-
-- 数据层：数据库主从 / 对象存储双写
-- 解析层：Cloudflare 健康检查 + 故障转移，或 DNSPod 监控
-- 配置层：IaC（Terraform）一键重建备机
-
----
-
-## 带宽与吞吐压测
-
-### iperf3 双向
-
-```bash
-# 服务端
-iperf3 -s
-# 客户端（上行）
-iperf3 -c server -t 30 -R
-# 客户端（下行）
-iperf3 -c server -t 30
-```
-
-### 真实 HTTP 测速
-
-```bash
-# 下行
-curl -o /dev/null -s -w "速度:%{speed_download} B/s 连接:%{time_connect}s\n" \
-  https://speed.cloudflare.com/__down?bytes=50000000
-# 上行
-curl -F "file=@/tmp/bigfile" https://speed.cloudflare.com/__up
-```
-
-### 延迟/丢包/mtr
-
-```bash
-mtr -rw your.target.com      # 实时路由质量
-ping -c 100 your.target.com  # 统计丢包
-```
-
----
-
-## 一键调优脚本
-
-### 网络加速脚本（Bash）
-
-```bash
-#!/bin/bash
-# net-boost.sh — 一键启用 BBR + 内核调优
-set -euo pipefail
-CONF=/etc/sysctl.d/99-net.conf
-
-echo "启用 BBR ..."
-sudo sysctl -w net.core.default_qdisc=fq
-sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
-
-cat > "$CONF" <<'EOF'
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
-net.ipv4.tcp_rmem=4096 87380 67108864
-net.ipv4.tcp_wmem=4096 65536 67108864
-net.ipv4.tcp_fin_timeout=15
-net.ipv4.tcp_tw_reuse=1
-net.ipv4.tcp_slow_start_after_idle=0
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_max_syn_backlog=8192
-net.core.somaxconn=8192
-net.netfilter.nf_conntrack_max=1048576
-EOF
-
-sudo sysctl -p "$CONF"
-echo "当前拥塞控制: $(sysctl -n net.ipv4.tcp_congestion_control)"
-echo "完成。建议 reboot 后复测吞吐。"
-```
-
-### PowerShell 远程网络体检
+## 🛠️ PowerShell脚本
 
 ```powershell
-# vps-net-check.ps1
-param([string]$HostIP="your.vps.ip", [string]$User="root")
-ssh "$User@$HostIP" '
-  echo "=== 拥塞控制 ==="; sysctl net.ipv4.tcp_congestion_control
-  echo "=== 连通性 ==="; ping -c 5 8.8.8.8 | tail -2
-  echo "=== 连接数 ==="; ss -s | head -3
-  echo "=== 缓冲 ==="; sysctl net.core.rmem_max
-'
+# 环境诊断：docker version/info/stats/disk/network 一键输出
+# 批量操作：start/stop/restart/logs/stats/clean 多容器管理
+# 镜像同步：Docker Hub → 阿里云ACR 批量拉取推送
+# 完整脚本见项目 scripts/ 目录
 ```
 
 ---
 
-## 故障排查手册
+## 🔗 相关资源
 
-### Q1：BBR 启用后仍慢
-
-- 确认内核支持：`sysctl net.ipv4.tcp_available_congestion_control` 含 bbr
-- 确认 `default_qdisc=fq`（否则 BBR 受限）
-- 链路本身差：换机房/线路
-
-### Q2：高并发下连接数上不去
-
-- 调 `somaxconn`、`nf_conntrack_max`
-- 调文件描述符 limits
-- 检查是否触发提供商端口限速
-
-### Q3：内网穿透延迟高
-
-- frp 中转走服务器带宽，选离你近的 VPS
-- 优先 Tailscale/WireGuard P2P 直连（打洞成功延迟最低）
-
-### Q4：Keepalived VIP 不漂移
-
-- 确认同二层/同广播域
-- 检查 `priority` 与 `advert_int`
-- 防火墙放行 VRRP（协议 112）
-
-### Q5：UDP 丢包（游戏/语音卡）
-
-- 调大 `rmem_max/wmem_max`
-- 用户态 WireGuard 考虑改内核栈或 TUN
-- 运营商对 UDP 限速则换 TCP 类协议
+| 资源 | 地址 |
+|------|------|
+| 🌐 主站 | https://clashvip.net |
+| 🧭 导航站 | https://nav.clashvip.net |
+| 🐙 社区 | https://bbs.clashhub.net |
+| 📦 下载站 | https://clash-for-windows.net |
+| 💰 VPS优惠 | https://vpsvip.net |
+| 🐳 Docker文档 | https://docs.docker.com |
+| ☸️ K3s文档 | https://docs.k3s.io |
+| 📊 Prometheus | https://prometheus.io/docs |
 
 ---
 
-## MTU 与分片优化
+**本项目仅供学习与研究使用，请遵守当地法律法规。**
 
-MTU 不匹配会导致神秘卡顿与降速，尤其在 PPPoE / 隧道嵌套场景。
+© 2024-2026 clashvip.net · clashhub.net · vpsvip.net · clash-for-windows.net
 
-```bash
-# 探测路径 MTU
-ping -c 1 -M do -s 1472 your.target.com   # 1472+28=1500
-# 逐步减小 -s 直到不通，找到最大不分包值
-```
-
-| 环境 | 建议 MTU |
-|------|----------|
-| 标准以太网 | 1500 |
-| PPPoE 拨号 | 1492（隧道用 1400）|
-| WireGuard | 1420 |
-| 双重隧道 | 1380 |
-| 极端受限 | 1280（IPv6 下限）|
-
-```bash
-# 设置网卡 MTU
-sudo ip link set eth0 mtu 1400
-# 持久化（Netplan）
-cat > /etc/netplan/99-mtu.yaml <<'EOF'
-network:
-  ethernets:
-    eth0:
-      mtu: 1400
-EOF
-sudo netplan apply
-```
-
-## TLS / QUIC 与协议选型
-
-应用层协议直接决定握手开销与抗审查能力：
-
-| 协议 | 握手 | 适用 |
-|------|------|------|
-| WireGuard | 1-RTT | 低延迟、移动漫游 |
-| VLESS+TLS | 1-RTT | 稳、抗识别 |
-| Trojan | 1-RTT | 伪装强 |
-| Hysteria2 | 0-RTT | 高丢包网络 |
-| QUIC(HTTP/3) | 0-RTT | Web 加速 |
-
-**建议**：Web 服务开 HTTP/3（Caddy/Nginx 支持），代理选低开销协议，高丢包环境用 Hysteria2。
-
-## 实战案例：跨境办公加速
-
-场景：团队在国内，需稳定访问 GitHub / AWS / 内部服务。
-
-```
-架构：
-  国内员工 ── WireGuard ──> VPS(HK) ──> GitHub/AWS
-                      └─ VPS 上 Clash 分流：
-                           github.com/AWS → 直连 VPS 出口
-                           内部服务 → 同 VPS 内网
-
-调优：
-  1. VPS 跑 net-boost.sh 启用 BBR
-  2. WireGuard mtu 1420 + keepalive 25
-  3. Clash 规则把 github/google 走最优节点
-  4. 关键服务加 VIP 双机热备
-
-效果（实测）：
-  git clone 大仓：从 8MB/s → 35MB/s
-  AWS API 延迟：从 220ms → 90ms
-```
-
----
-
-## 总结与行动清单
-
-### 本仓库价值
-
-1. BBR/锐速/内核参数分层调优
-2. 内网穿透（frp/Tailscale）可直接抄
-3. 负载均衡与双机热备架构
-4. 压测与一键调优脚本
-
-### 立即可执行
-
-- [ ] 跑 `net-boost.sh` 启用 BBR
-- [ ] 调内核缓冲与连接数
-- [ ] 需要外网访问内网时部署 Tailscale
-- [ ] 多实例用 Nginx/HAProxy 负载
-- [ ] 关键业务上 Keepalived/VIP
-
----
-
-**VPS 与机场双向指南（保留全部推广入口）**：
-
-> VPS 专业评测与价格分析 → [ClashHub](https://clashhub.net)  
-> 订阅管理 / 机场节点优选 → [ClashVIP 导航站](https://nav.clashvip.net)  
-> 高速稳定机场推荐 → [VPSVIP](https://vpsvip.net)  
-> 代理协议与工具配置 → [Clash For Windows 官网](https://www.clash-for-windows.net)  
-> 用户交流与技术讨论 → [ClashHub 论坛](https://bbs.clashhub.net)
-
----
-
-*本指南基于公开资料与实战经验整理，供学习参考。请遵守当地法律法规，合理使用网络工具。*
-
-*最后更新：2026-09-03 | 仓库：vps-review-20260409*
+_2026-10-08_
